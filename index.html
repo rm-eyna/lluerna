@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+<meta charset="utf-8">
+<title>Lluerna</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#0d0716;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* ===== Lluerna: laberint de bardisses i persecució d'aranyes ===== */
+
+// Laberint (21x21). # bardissa, . passadís amb gota, n niu, D porta del niu.
+// La fila 10 és el túnel: surt per un costat i apareix per l'altre.
+const MAP = [
+  "#####################",
+  "#.........#.........#",
+  "#.###.###.#.###.###.#",
+  "#.....#.......#.....#",
+  "#####.#.#####.#.#####",
+  "#.....#...#...#.....#",
+  "#.###.###.#.###.###.#",
+  "#.....#.......#.....#",
+  "#####.#.##D##.#.#####",
+  "#####.#.#nnn#.#.#####",
+  "........#nnn#........",
+  "#####.#.#nnn#.#.#####",
+  "#####.#.#####.#.#####",
+  "#.....#.......#.....#",
+  "#.###.###.#.###.###.#",
+  "#.....#...#...#.....#",
+  "#####.#.#####.#.#####",
+  "#.....#.......#.....#",
+  "#.###.###.#.###.###.#",
+  "#.........#.........#",
+  "#####################"
+];
+const C = 24, W = 21, H = 21, HUD = 44;
+const LW = W * C, LH = HUD + H * C + 8;       // mida lògica fixa del canvas
+const TY = 10;                                  // fila del túnel
+const OUT = { x: 10, y: 7 }, NEST = { x: 10, y: 10 }, PSTART = { x: 10, y: 13 };
+const FLOWERS = [[1, 1], [19, 1], [1, 19], [19, 19]];
+const UP = { x: 0, y: -1 }, LEFT = { x: -1, y: 0 }, DOWN = { x: 0, y: 1 }, RIGHT = { x: 1, y: 0 };
+const DIRS = [UP, LEFT, DOWN, RIGHT];
+const KEYDIR = { arrowup: UP, w: UP, arrowleft: LEFT, a: LEFT, arrowdown: DOWN, s: DOWN, arrowright: RIGHT, d: RIGHT };
+
+// Les tres aranyes
+const GDEF = [
+  { name: 'Teranyina', color: '#c2283f', dark: '#6e1224', kind: 'chase',  corner: { x: 19, y: 1 },  rel: 0 },
+  { name: 'Talla-pas', color: '#d9a031', dark: '#7d5712', kind: 'ambush', corner: { x: 1, y: 1 },   rel: 3 },
+  { name: 'Rodamón',   color: '#9d93bd', dark: '#544b73', kind: 'random', corner: { x: 1, y: 19 },  rel: 6 }
+];
+// Fases alternes: [segons, mode]
+const SCHED = [[6, 'scatter'], [18, 'chase'], [5, 'scatter'], [20, 'chase'], [4, 'scatter'], [9999, 'chase']];
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const bg = document.createElement('canvas');
+const bctx = bg.getContext('2d');
+let k = 1;  // factor lògic -> píxels
+
+// ---------- Estat ----------
+let state = 'title';           // title | ready | play | dying | clear | over
+let paused = false;
+let clock = 0;                 // rellotge d'animació (no s'atura a la pausa)
+let gclock = 0;                // rellotge de joc (s'atura a la pausa)
+let score = 0, lives = 3, level = 1, record = 0, newRec = false, overT = 0;
+let readyT = 0, dyT = 0, clearT = 0;
+let pel = [], remaining = 0;
+let player, ghosts = [];
+let want = null, wantT = 0;
+const keys = new Set();
+let mode = 'scatter', modeIdx = 0, modeT = 0;
+let frightT = 0, combo = 0;
+let popups = [];
+
+try { record = parseInt(localStorage.getItem('lluerna.record'), 10) || 0; } catch (e) { record = 0; }
+
+// ---------- Utilitats del laberint ----------
+function cell(x, y) {
+  if (x < 0 || x >= W) return (y === TY && (x === -1 || x === W)) ? '.' : '#';   // túnel
+  if (y < 0 || y >= H) return '#';
+  return MAP[y][x];
+}
+const walkP = (x, y) => { const c = cell(x, y); return c !== '#' && c !== 'D' && c !== 'n'; };
+const walkG = (x, y) => { const c = cell(x, y); return c !== '#' && c !== 'D' && c !== 'n'; };
+
+// Primer pas del camí més curt (permet la porta i el niu); null si no cal moure's
+function bfs(sx, sy, tx, ty) {
+  if (sx === tx && sy === ty) return null;
+  const seen = new Set([sy * W + sx]);
+  const q = [[sx, sy, null]];
+  while (q.length) {
+    const [x, y, first] = q.shift();
+    for (const d of DIRS) {
+      const nx = x + d.x, ny = y + d.y;
+      if (nx < 0 || nx >= W || ny < 0 || ny >= H || MAP[ny][nx] === '#') continue;
+      const key = ny * W + nx;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const f = first || d;
+      if (nx === tx && ny === ty) return f;
+      q.push([nx, ny, f]);
+    }
+  }
+  return null;
+}
+
+function buildLevel() {
+  pel = MAP.map(r => [...r].map(c => (c === '.' ? 1 : 0)));
+  FLOWERS.forEach(([x, y]) => { pel[y][x] = 2; });
+  pel[PSTART.y][PSTART.x] = 0;
+  remaining = 0;
+  pel.forEach(r => r.forEach(v => { if (v) remaining++; }));
+}
+
+const playerSpeed = () => Math.min(8.4, 5.6 + 0.4 * (level - 1));
+const ghostBase = () => Math.min(8, 5.0 + 0.45 * (level - 1));
+const frightDur = () => Math.max(3, 7 - 1.1 * (level - 1));
+
+function resetPositions() {
+  player = { cx: PSTART.x, cy: PSTART.y, dx: 0, dy: 0, prog: 0, ang: Math.PI, fx: -1, fy: 0 };
+  const rs = 1 + 0.12 * (level - 1);
+  ghosts = GDEF.map((d, i) => ({
+    d, cx: i === 0 ? 10 : (i === 1 ? 9 : 11), cy: i === 0 ? 7 : 10,
+    dx: 0, dy: 0, prog: 0, ang: -Math.PI / 2,
+    state: i === 0 ? 'active' : 'nest', fright: false, rel: d.rel / rs
+  }));
+  ghosts[0].dx = -1; ghosts[0].ang = Math.PI;
+  want = null; frightT = 0; combo = 0;
+  modeIdx = 0; mode = SCHED[0][1]; modeT = SCHED[0][0];
+  popups = [];
+}
+
+function newGame() {
+  score = 0; lives = 3; level = 1; newRec = false; paused = false;
+  buildLevel(); resetPositions();
+  state = 'ready'; readyT = 1.8;
+}
+
+// ---------- Moviment ----------
+// Avança 'dist' cel·les; a cada cel·la nova crida onArrive per triar direcció.
+// Mai es creua una paret perquè només s'entra a cel·les que onArrive ha validat.
+function moveEntity(e, dist, onArrive) {
+  while (dist > 0) {
+    if (e.dx === 0 && e.dy === 0) { onArrive(e); if (e.dx === 0 && e.dy === 0) return; }
+    const rem = 1 - e.prog;
+    if (dist < rem) { e.prog += dist; return; }
+    dist -= rem;
+    e.cx += e.dx; e.cy += e.dy; e.prog = 0;
+    // túnel: cel·les virtuals -1 i W, es teletransporta a l'altre costat
+    if (e.cy === TY) {
+      if (e.cx === -1 && e.dx < 0) e.cx = W;
+      else if (e.cx === W && e.dx > 0) e.cx = -1;
+    }
+    onArrive(e);
+    if (e.dx === 0 && e.dy === 0) return;
+  }
+}
+function reverse(e) {
+  if (!e.dx && !e.dy) return;
+  e.cx += e.dx; e.cy += e.dy;
+  e.dx = -e.dx; e.dy = -e.dy;
+  e.prog = 1 - e.prog;
+  e.ang = Math.atan2(e.dy, e.dx);
+}
+const heldDir = () => { let d = null; for (const key of keys) if (KEYDIR[key]) d = KEYDIR[key]; return d; };
+
+function playerArrive(e) {
+  if (e.cx >= 0 && e.cx < W) eat(e.cx, e.cy);
+  let w = want || heldDir();
+  if (w && !walkP(e.cx + w.x, e.cy + w.y)) { const h = heldDir(); if (h && walkP(e.cx + h.x, e.cy + h.y)) w = h; }
+  if (w && walkP(e.cx + w.x, e.cy + w.y)) {
+    e.dx = w.x; e.dy = w.y; e.fx = w.x; e.fy = w.y;
+    e.ang = Math.atan2(w.y, w.x);
+    if (want === w) want = null;
+  } else if (!(e.dx || e.dy) || !walkP(e.cx + e.dx, e.cy + e.dy)) {
+    e.dx = 0; e.dy = 0;
+  }
+}
+
+function eat(x, y) {
+  const v = pel[y][x];
+  if (!v) return;
+  pel[y][x] = 0; remaining--;
+  if (v === 1) score += 10;
+  else {
+    score += 50;
+    frightT = frightDur();   // combo acumulat dins del nivell: 200, 400, 800, 1600
+    for (const g of ghosts) {
+      if (g.state === 'eyes') continue;
+      if (g.state === 'active' && !g.fright) reverse(g);
+      g.fright = true;
+    }
+  }
+  if (remaining <= 0) { state = 'clear'; clearT = 2.4; }
+}
+
+const pcell = () => ({ x: Math.round(player.cx + player.dx * player.prog), y: Math.round(player.cy + player.dy * player.prog) });
+const d2 = (ax, ay, bx, by) => (ax - bx) * (ax - bx) + (ay - by) * (ay - by);
+
+function ghostArrive(g) {
+  if (g.state === 'nest') return;
+  if (g.cx < 0 || g.cx >= W) return;                 // cel·la virtual del túnel: segueix recte
+  if (g.state === 'eyes') {
+    if (g.cx === NEST.x && g.cy === NEST.y) { g.state = 'nest'; g.rel = 1.2; g.dx = g.dy = 0; g.prog = 0; return; }
+    const d = bfs(g.cx, g.cy, NEST.x, NEST.y);
+    if (d) { g.dx = d.x; g.dy = d.y; g.ang = Math.atan2(d.y, d.x); }
+    return;
+  }
+  if (g.state === 'leaving') {
+    if (g.cx === OUT.x && g.cy === OUT.y) g.state = 'active';
+    else {
+      const d = bfs(g.cx, g.cy, OUT.x, OUT.y);
+      if (d) { g.dx = d.x; g.dy = d.y; g.ang = Math.atan2(d.y, d.x); }
+      return;
+    }
+  }
+  // Mode actiu: decideix a la cruïlla, sense girar 180° si hi ha alternativa
+  const moving = g.dx || g.dy;
+  let cands = [];
+  for (const d of DIRS) {
+    if (moving && d.x === -g.dx && d.y === -g.dy) continue;
+    if (walkG(g.cx + d.x, g.cy + d.y)) cands.push(d);
+  }
+  if (!cands.length) {
+    const r = { x: -g.dx, y: -g.dy };
+    if (walkG(g.cx + r.x, g.cy + r.y)) cands.push(r); else return;
+  }
+  let pick;
+  const p = pcell();
+  if (g.fright) {
+    // Fuig: l'opció que més l'allunya del jugador
+    let best = -1;
+    for (const d of cands) { const v = d2(g.cx + d.x, g.cy + d.y, p.x, p.y) + Math.random() * 0.1; if (v > best) { best = v; pick = d; } }
+  } else if (mode === 'scatter') {
+    pick = nearest(cands, g, g.d.corner.x, g.d.corner.y);
+  } else if (g.d.kind === 'chase') {
+    pick = nearest(cands, g, p.x, p.y);
+  } else if (g.d.kind === 'ambush') {
+    pick = nearest(cands, g, p.x + player.fx * 4, p.y + player.fy * 4);
+  } else {
+    pick = cands[Math.floor(Math.random() * cands.length)];
+  }
+  g.dx = pick.x; g.dy = pick.y; g.ang = Math.atan2(pick.y, pick.x);
+}
+function nearest(cands, g, tx, ty) {
+  let best = Infinity, pick = cands[0];
+  for (const d of cands) { const v = d2(g.cx + d.x, g.cy + d.y, tx, ty); if (v < best) { best = v; pick = d; } }
+  return pick;
+}
+
+function ghostSpeed(g) {
+  if (g.state === 'eyes') return 11;
+  if (g.state === 'leaving') return 4;
+  let s = ghostBase();
+  if (g.d.kind === 'random') s *= 0.92;
+  if (g.fright) s *= 0.5;
+  if (g.cy === TY && (g.cx <= 1 || g.cx >= W - 2)) s *= 0.6;   // més lentes al túnel
+  return s;
+}
+
+// ---------- Col·lisions ----------
+const wrapD = (a, b) => { let d = a - b; const P = W + 1; if (d > P / 2) d -= P; else if (d < -P / 2) d += P; return d; };
+function collide() {
+  const px = player.cx + player.dx * player.prog, py = player.cy + player.dy * player.prog;
+  for (const g of ghosts) {
+    if (g.state === 'nest' || g.state === 'eyes') continue;
+    const dx = wrapD(px, g.cx + g.dx * g.prog), dy = py - (g.cy + g.dy * g.prog);
+    if (dx * dx + dy * dy >= 0.55 * 0.55) continue;
+    if (g.fright) {
+      const pts = 200 * Math.pow(2, Math.min(combo, 3));
+      combo++; score += pts;
+      popups.push({ x: g.cx + g.dx * g.prog, y: g.cy + g.dy * g.prog, t: 1, txt: String(pts) });
+      g.state = 'eyes'; g.fright = false;
+    } else {
+      lives--; state = 'dying'; dyT = 1.3;
+      return;
+    }
+  }
+}
+
+// ---------- Actualització ----------
+function update(dt) {
+  clock += dt;
+  if (paused || state === 'title' || state === 'over') return;
+  gclock += dt;
+  for (const p of popups) p.t -= dt;
+  popups = popups.filter(p => p.t > 0);
+
+  if (state === 'ready') { readyT -= dt; if (readyT <= 0) state = 'play'; return; }
+  if (state === 'dying') {
+    dyT -= dt;
+    if (dyT <= 0) {
+      if (lives <= 0) endGame();
+      else { resetPositions(); state = 'ready'; readyT = 1.8; }
+    }
+    return;
+  }
+  if (state === 'clear') {
+    clearT -= dt;
+    if (clearT <= 0) { level++; buildLevel(); resetPositions(); state = 'ready'; readyT = 1.8; }
+    return;
+  }
+
+  // Temporitzadors
+  if (want && gclock - wantT > 1.5) want = null;
+  if (frightT > 0) {
+    frightT -= dt;
+    if (frightT <= 0) { frightT = 0; ghosts.forEach(g => { g.fright = false; }); }
+  }
+  modeT -= dt;
+  if (modeT <= 0) {
+    modeIdx = Math.min(modeIdx + 1, SCHED.length - 1);
+    mode = SCHED[modeIdx][1]; modeT = SCHED[modeIdx][0];
+    ghosts.forEach(g => { if (g.state === 'active' && !g.fright) reverse(g); });
+  }
+  for (const g of ghosts) {
+    if (g.state === 'nest') {
+      g.rel -= dt;
+      if (g.rel <= 0) { g.state = 'leaving'; g.dx = g.dy = 0; g.prog = 0; }
+    }
+  }
+
+  // Subpassos curts perquè dues entitats mai es creuin sense detectar-se
+  const steps = Math.ceil(12 * dt / 0.12);
+  const sdt = dt / steps;
+  for (let i = 0; i < steps && state === 'play'; i++) {
+    if (want && (player.dx || player.dy) && want.x === -player.dx && want.y === -player.dy && player.prog > 0) {
+      reverse(player); want = null;     // inversió immediata a mig camí
+    }
+    moveEntity(player, playerSpeed() * sdt, playerArrive);
+    if (state !== 'play') break;
+    for (const g of ghosts) if (g.state !== 'nest') moveEntity(g, ghostSpeed(g) * sdt, ghostArrive);
+    collide();
+  }
+}
+
+function endGame() {
+  state = 'over'; overT = clock;
+  newRec = score > record;
+  if (newRec) {
+    record = score;
+    try { localStorage.setItem('lluerna.record', String(score)); } catch (e) { /* sense emmagatzematge */ }
+  }
+}
+
+// ---------- Entrada ----------
+window.addEventListener('keydown', e => {
+  const key = e.key.toLowerCase();
+  if (KEYDIR[key] || e.key === ' ') e.preventDefault();
+  if (e.repeat) return;
+  keys.add(key);
+  if (KEYDIR[key]) { want = KEYDIR[key]; wantT = gclock; return; }
+  if (e.key === ' ') {
+    if (state === 'title') newGame();
+    else if (state === 'over' && clock - overT > 0.8) newGame();
+  } else if (key === 'p' && ['ready', 'play', 'dying', 'clear'].includes(state)) {
+    paused = !paused;
+  }
+});
+window.addEventListener('keyup', e => { keys.delete(e.key.toLowerCase()); });
+function autoPause() {
+  keys.clear();
+  if (['ready', 'play', 'dying', 'clear'].includes(state)) paused = true;
+}
+window.addEventListener('blur', autoPause);
+document.addEventListener('visibilitychange', () => { if (document.hidden) autoPause(); });
+
+// ---------- Dibuix: fons i bardisses (es pre-renderitza) ----------
+let seed = 7;
+const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+
+function wallBlob(c, color, inset, ox, oy, alpha) {
+  c.fillStyle = color; c.globalAlpha = alpha === undefined ? 1 : alpha;
+  const s = C - 2 * inset, r = s / 2.6;
+  const isW = (x, y) => cell(x, y) === '#' && x >= 0 && x < W && y >= 0 && y < H;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (MAP[y][x] !== '#') continue;
+    const px = x * C + inset + ox, py = HUD + y * C + inset + oy;
+    c.beginPath(); c.roundRect(px, py, s, s, r); c.fill();
+    if (isW(x + 1, y)) c.fillRect(px + s / 2, py, C, s);
+    if (isW(x, y + 1)) c.fillRect(px, py + s / 2, s, C);
+  }
+  c.globalAlpha = 1;
+}
+
+function buildBg() {
+  bg.width = canvas.width; bg.height = canvas.height;
+  const c = bctx;
+  c.setTransform(k, 0, 0, k, 0, 0);
+  // terra violeta fosc amb una llum suau al centre
+  c.fillStyle = '#170f23'; c.fillRect(0, 0, LW, LH);
+  const g = c.createRadialGradient(LW / 2, LH / 2, 30, LW / 2, LH / 2, LW * 0.85);
+  g.addColorStop(0, '#2b1c3f'); g.addColorStop(1, '#120a1c');
+  c.fillStyle = g; c.fillRect(0, HUD, LW, H * C);
+  seed = 7;
+  for (let i = 0; i < 260; i++) {
+    c.fillStyle = rnd() < 0.5 ? 'rgba(160,120,220,0.10)' : 'rgba(0,0,0,0.18)';
+    c.beginPath(); c.arc(rnd() * LW, HUD + rnd() * H * C, 0.6 + rnd() * 1.4, 0, 7); c.fill();
+  }
+  // nínxol del niu
+  c.fillStyle = 'rgba(90,50,120,0.55)'; c.beginPath(); c.roundRect(9 * C + 2, HUD + 9 * C + 2, 3 * C - 4, 3 * C - 4, 8); c.fill();
+  // bardisses: ombra, vora, cos, relleu i fullam
+  wallBlob(c, '#000', 0, 1, 3, 0.35);
+  wallBlob(c, '#0b3320', 1.2, 0, 0);
+  wallBlob(c, '#1d6a3a', 3, 0, 0);
+  wallBlob(c, '#2f9a55', 6.5, -1, -1.5, 0.75);
+  seed = 99;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (MAP[y][x] !== '#') continue;
+    for (let i = 0; i < 4; i++) {
+      c.fillStyle = rnd() < 0.5 ? 'rgba(120,220,140,0.35)' : 'rgba(5,40,20,0.45)';
+      c.beginPath(); c.arc(x * C + 3 + rnd() * (C - 6), HUD + y * C + 3 + rnd() * (C - 6), 1 + rnd() * 1.3, 0, 7); c.fill();
+    }
+  }
+  // porta del niu
+  c.fillStyle = '#d58fc2'; c.beginPath(); c.roundRect(10 * C + 2, HUD + 8 * C + C / 2 - 2, C - 4, 4, 2); c.fill();
+  // franja del HUD
+  c.fillStyle = '#0f0818'; c.fillRect(0, 0, LW, HUD - 4);
+  c.fillStyle = 'rgba(160,120,220,0.25)'; c.fillRect(0, HUD - 5, LW, 1);
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const s = Math.min(window.innerWidth / LW, window.innerHeight / LH);
+  canvas.style.width = (LW * s) + 'px'; canvas.style.height = (LH * s) + 'px';
+  canvas.width = Math.max(1, Math.round(LW * s * dpr)); canvas.height = Math.max(1, Math.round(LH * s * dpr));
+  k = s * dpr;
+  buildBg();
+}
+window.addEventListener('resize', resize);
+
+// ---------- Dibuix: elements ----------
+function txt(s, x, y, size, color, weight, align, shadow) {
+  ctx.font = (weight || '600') + ' ' + size + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.textAlign = align || 'center'; ctx.textBaseline = 'middle';
+  if (shadow) { ctx.shadowColor = shadow; ctx.shadowBlur = 10; }
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function drawDrop(x, y, tw) {
+  ctx.fillStyle = 'rgba(150,210,255,' + (0.14 + 0.1 * tw) + ')';
+  ctx.beginPath(); ctx.arc(x, y + 1, 5, 0, 7); ctx.fill();
+  ctx.fillStyle = '#a9dcff';
+  ctx.beginPath();
+  ctx.moveTo(x, y - 3.8);
+  ctx.bezierCurveTo(x + 0.8, y - 1.6, x + 2.6, y - 0.6, x + 2.6, y + 0.9);
+  ctx.arc(x, y + 0.9, 2.6, 0, Math.PI, false);
+  ctx.bezierCurveTo(x - 2.6, y - 0.6, x - 0.8, y - 1.6, x, y - 3.8);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,' + (0.6 + 0.4 * tw) + ')';
+  ctx.beginPath(); ctx.arc(x - 0.9, y + 0.2, 0.8, 0, 7); ctx.fill();
+}
+
+function drawFlower(x, y) {
+  const pulse = 1 + 0.1 * Math.sin(clock * 5);
+  ctx.strokeStyle = '#4f9d57'; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x, y + 9); ctx.lineTo(x, y); ctx.stroke();
+  ctx.fillStyle = 'rgba(180,140,255,0.18)';
+  ctx.beginPath(); ctx.arc(x, y - 2, 11 * pulse, 0, 7); ctx.fill();
+  for (let i = 0; i < 5; i++) {
+    const fy = y + 3 - i * 3.1, fr = (3.4 - i * 0.35) * pulse;
+    ctx.fillStyle = i % 2 ? '#b99cff' : '#8e6bd8';
+    ctx.beginPath(); ctx.ellipse(x - 1.6, fy, fr, 1.9, -0.4, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + 1.6, fy - 1, fr, 1.9, 0.4, 0, 7); ctx.fill();
+  }
+}
+
+// Cuca de llum: cos fosc, ales translúcides i fanal verd-groguenc que pampalluga
+function drawWorm(x, y, ang, scale, glowK) {
+  const flick = 0.75 + 0.25 * Math.sin(clock * 11) * Math.sin(clock * 3.1);
+  ctx.save(); ctx.translate(x, y);
+  ctx.globalCompositeOperation = 'lighter';
+  const gl = ctx.createRadialGradient(0, 0, 2, 0, 0, 38 * scale);
+  gl.addColorStop(0, 'rgba(210,240,90,' + (0.30 * flick * glowK) + ')'); gl.addColorStop(1, 'rgba(210,240,90,0)');
+  ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(0, 0, 38 * scale, 0, 7); ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.rotate(ang); ctx.scale(scale, scale);
+  const flap = 0.5 + 0.5 * Math.sin(clock * 42);
+  ctx.fillStyle = 'rgba(235,245,255,0.5)';
+  for (const s of [-1, 1]) {
+    ctx.save(); ctx.rotate(s * (0.55 + 0.35 * flap));
+    ctx.beginPath(); ctx.ellipse(-1, s * 4.6, 5, 2.2, 0, 0, 7); ctx.fill(); ctx.restore();
+  }
+  ctx.fillStyle = '#3d2c1c'; ctx.beginPath(); ctx.ellipse(0, 0, 5.4, 2.7, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#5a4128'; ctx.beginPath(); ctx.arc(5.2, 0, 2.2, 0, 7); ctx.fill();
+  const tg = ctx.createRadialGradient(-5, 0, 0, -5, 0, 5.5);
+  tg.addColorStop(0, 'rgba(255,255,170,' + glowK + ')'); tg.addColorStop(0.5, 'rgba(190,240,70,' + (0.9 * flick * glowK) + ')'); tg.addColorStop(1, 'rgba(160,230,60,0)');
+  ctx.fillStyle = tg; ctx.beginPath(); ctx.arc(-5, 0, 5.5, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+// Aranya: abdomen i cap rodons, 8 potes que s'agiten i ulls
+function drawSpider(x, y, r, color, dark, ang, phase, eyesOnly) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+  if (!eyesOnly) {
+    ctx.strokeStyle = dark; ctx.lineWidth = 1.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const s of [-1, 1]) for (let i = 0; i < 4; i++) {
+      const w = Math.sin(phase + i * 1.7 + (s > 0 ? Math.PI : 0)) * 0.3;
+      const a1 = s * (0.9 + i * 0.45) + w;
+      const bx = Math.cos(a1) * r * 0.6, by = Math.sin(a1) * r * 0.6;
+      const kx = bx + Math.cos(a1) * r * 0.75, ky = by + Math.sin(a1) * r * 0.75;
+      const a2 = a1 + s * (0.7 - w);
+      ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(kx, ky);
+      ctx.lineTo(kx + Math.cos(a2) * r * 0.6, ky + Math.sin(a2) * r * 0.6); ctx.stroke();
+    }
+    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(-r * 0.25, 0, r * 0.95, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.22)'; ctx.beginPath(); ctx.arc(-r * 0.45, -r * 0.35, r * 0.3, 0, 7); ctx.fill();
+    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(r * 0.75, 0, r * 0.62, 0, 7); ctx.fill();
+    ctx.fillStyle = dark; ctx.beginPath(); ctx.arc(-r * 0.4, 0, r * 0.3, 0, 7); ctx.fill();
+  }
+  for (const s of [-1, 1]) {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(r * 0.95, s * r * 0.28, r * 0.24, 0, 7); ctx.fill();
+    ctx.fillStyle = '#1a1020'; ctx.beginPath(); ctx.arc(r * 1.02, s * r * 0.28, r * 0.11, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawGhost(g) {
+  const gx = (g.cx + g.dx * g.prog + 0.5) * C;
+  let gy = HUD + (g.cy + g.dy * g.prog + 0.5) * C;
+  if (g.state === 'nest') gy += Math.sin(clock * 4 + g.cx) * 1.5;
+  let col = g.d.color, dark = g.d.dark;
+  if (g.fright) {
+    const blink = frightT < 1.4 && Math.floor(clock * 8) % 2 === 0;
+    col = blink ? '#f2f0ff' : '#58c7c0'; dark = blink ? '#9c97c4' : '#23707a';
+  }
+  drawSpider(gx, gy, 8, col, dark, g.ang, clock * 16, g.state === 'eyes');
+}
+
+function drawWorld() {
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(bg, 0, 0); ctx.restore();
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = pel[y][x]; if (!v) continue;
+    const px = (x + 0.5) * C, py = HUD + (y + 0.5) * C;
+    if (v === 1) drawDrop(px, py, Math.sin(clock * 3 + x * 1.3 + y * 0.7) * 0.5 + 0.5);
+    else drawFlower(px, py);
+  }
+  for (const g of ghosts) drawGhost(g);
+  if (state === 'dying') {
+    const t = 1 - Math.max(0, dyT) / 1.3;
+    drawWorm((player.cx + player.dx * player.prog + 0.5) * C, HUD + (player.cy + player.dy * player.prog + 0.5) * C, player.ang + t * 12, Math.max(0.05, 1 - t), 1 - t);
+  } else {
+    drawWorm((player.cx + player.dx * player.prog + 0.5) * C, HUD + (player.cy + player.dy * player.prog + 0.5) * C, player.ang, 1, 1);
+  }
+  for (const p of popups) txt(p.txt, (p.x + 0.5) * C, HUD + (p.y + 0.5) * C - (1 - p.t) * 14, 13, '#bff3ff', '700', 'center', '#000');
+}
+
+function drawHUD() {
+  const lab = '#9d8ac4', val = '#fff4b0';
+  txt('PUNTS', 14, 13, 10, lab, '600', 'left'); txt(String(score), 14, 31, 18, val, '700', 'left');
+  txt('RÈCORD', 150, 13, 10, lab, '600', 'left'); txt(String(Math.max(record, score)), 150, 31, 18, val, '700', 'left');
+  txt('NIVELL', 270, 13, 10, lab, '600', 'left'); txt(String(level), 270, 31, 18, val, '700', 'left');
+  txt('VIDES', LW - 14, 13, 10, lab, '600', 'right');
+  for (let i = 0; i < Math.max(0, lives); i++) {
+    const x = LW - 24 - i * 22, y = 31;
+    ctx.fillStyle = 'rgba(200,240,80,0.28)'; ctx.beginPath(); ctx.arc(x - 3, y, 8, 0, 7); ctx.fill();
+    ctx.fillStyle = '#3d2c1c'; ctx.beginPath(); ctx.ellipse(x, y, 5, 2.5, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#d6f25a'; ctx.beginPath(); ctx.arc(x - 5, y, 3, 0, 7); ctx.fill();
+  }
+}
+
+function dim(a) { ctx.fillStyle = 'rgba(10,5,18,' + a + ')'; ctx.fillRect(0, 0, LW, LH); }
+function banner(s) {
+  const y = HUD + 12.5 * C;
+  ctx.fillStyle = 'rgba(12,6,22,0.85)'; ctx.beginPath(); ctx.roundRect(LW / 2 - 110, y - 20, 220, 40, 12); ctx.fill();
+  ctx.strokeStyle = 'rgba(210,240,90,0.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+  txt(s, LW / 2, y, 20, '#f2f7a0', '700', 'center', '#a8d63a');
+}
+const blinkOn = () => Math.floor(clock * 2) % 2 === 0;
+
+function drawTitle() {
+  dim(0.82);
+  txt('LLUERNA', LW / 2, 120, 50, '#f2f7a0', '800', 'center', '#b7e044');
+  txt('Una cuca de llum, un jardí de nit i tres aranyes', LW / 2, 160, 13, '#cdbcf0', '500');
+  GDEF.forEach((d, i) => {
+    const y = 215 + i * 36;
+    drawSpider(100, y, 8, d.color, d.dark, 0, clock * 10, false);
+    txt(d.name, 130, y, 15, d.color === '#9d93bd' ? '#c4bbe0' : d.color, '700', 'left');
+    txt(['et persegueix', 'et talla el pas', 'va a l\'atzar'][i], 235, y, 14, '#cdbcf0', '500', 'left');
+  });
+  drawFlower(100, 340); txt('Les flors de lavanda espanten les aranyes', 130, 342, 13, '#cdbcf0', '500', 'left');
+  txt('Fletxes o WASD per moure\'t  ·  P per fer pausa', LW / 2, 395, 13, '#fff4b0', '500');
+  txt('Rècord: ' + record, LW / 2, 430, 17, '#fff4b0', '700');
+  if (blinkOn()) txt('Prem espai per començar', LW / 2, 485, 20, '#f2f7a0', '700', 'center', '#a8d63a');
+}
+
+function drawOver() {
+  dim(0.8);
+  txt('FI DE LA PARTIDA', LW / 2, 180, 36, '#f2f7a0', '800', 'center', '#b7e044');
+  txt('Puntuació: ' + score, LW / 2, 245, 22, '#fff4b0', '700');
+  txt('Rècord: ' + record, LW / 2, 280, 18, '#cdbcf0', '600');
+  if (newRec) txt('Nou rècord!', LW / 2, 325, 26, '#ffd35a', '800', 'center', '#ff9d2e');
+  ctx.globalAlpha = clock - overT > 0.8 ? 1 : 0.3;
+  if (blinkOn() || clock - overT <= 0.8) txt('Prem espai per tornar a jugar', LW / 2, 420, 20, '#f2f7a0', '700', 'center', '#a8d63a');
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  drawWorld();
+  drawHUD();
+  if (state === 'title') drawTitle();
+  else if (state === 'over') drawOver();
+  else if (state === 'ready') banner('Preparats…');
+  else if (state === 'clear') banner('Nivell ' + level + ' superat');
+  if (paused) {
+    dim(0.65);
+    txt('Pausa', LW / 2, LH / 2 - 10, 44, '#f2f7a0', '800', 'center', '#b7e044');
+    txt('Prem P per continuar', LW / 2, LH / 2 + 30, 16, '#cdbcf0', '500');
+  }
+}
+
+// ---------- Bucle principal ----------
+let last = performance.now();
+function frame(ts) {
+  let dt = (ts - last) / 1000; last = ts;
+  if (!(dt > 0)) dt = 0;
+  if (dt > 0.033) dt = 0.033;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+buildLevel(); resetPositions(); resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
